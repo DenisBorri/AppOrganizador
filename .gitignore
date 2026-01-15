@@ -6,3 +6,4 @@ extraction_log.txt
 facturas prueba/
 .idea/
 .vscode/
+test_*.py
