@@ -40,6 +40,8 @@ def main():
         if factura.emisor:
              print(f"      - Razón Social: {factura.emisor}")
         print(f"   👤 Cliente: {factura.cuit_receptor} (CUIT)")
+        if factura.receptor:
+            print(f"      - Nombre: {factura.receptor}")
         print(f"   🧾 Tipo: {factura.tipo_factura}")
 
     print("\n--- FIN DE PRUEBA ---")

@@ -135,47 +135,95 @@ class ProcesadorFacturas:
             datos["fecha_emision"] = match_fecha.group(1).replace('-', '/')
 
         # --- 3. Receptor (Cliente) ---
-        match_receptor = re.search(r"(?:Apellido y Nombre|Razón Social|Cliente|Señor\s*\(es\)|Sr\.)\s*[:/]?\s*\n?\s*(.+)", texto, re.IGNORECASE)
-        if match_receptor:
-            raw_receptor = match_receptor.group(1).strip()
-            # Quitamos "(41) " o similares
-            datos["receptor"] = re.sub(r"^\(\d+\)\s*", "", raw_receptor)
+        # Prioridad: "Señor (es):", "Apellido y Nombre:", "Razon Social:"
+        # Permitimos saltos de línea y texto intermedio corto
+        patron_cliente = r"(?:Señor\s*\(es\)|Apellido y Nombre|Razón Social|Cliente|Sr\.)[\s\.:]*\n?\s*(?P<nombre>.+)"
+        match_cliente = re.search(patron_cliente, texto, re.IGNORECASE)
+        if match_cliente:
+            raw_receptor = match_cliente.group("nombre").strip()
+            # Limpieza: si el nombre es muy largo o contiene keywords de otra cosa, cortar
+            # Cortar en "Fecha", "Domicilio", "Condición"
+            cortes = ["Fecha", "Domicilio", "Condici", "C.U.I.T"]
+            for c in cortes:
+                if c.lower() in raw_receptor.lower():
+                    raw_receptor = re.split(c, raw_receptor, flags=re.IGNORECASE)[0]
             
-        # --- 4. CUITs ---
-        # Buscamos todos los CUITs en el documento
-        matches_cuit = re.findall(r"CUIT\s*[:.-]?\s*\n?\s*(\d{2}-?\d{8}-?\d)", texto, re.IGNORECASE)
-        if matches_cuit:
-            # Lógica simple: Primer CUIT encontrado suele ser Emisor
-            datos["cuit_emisor"] = matches_cuit[0]
-            if len(matches_cuit) > 1:
-                # Si el segundo es diferente, es receptor
-                if matches_cuit[1] != matches_cuit[0]:
-                    datos["cuit_receptor"] = matches_cuit[1]
-                elif len(matches_cuit) > 2:
-                    datos["cuit_receptor"] = matches_cuit[2]
+            datos["receptor"] = re.sub(r"^\(\d+\)\s*", "", raw_receptor).strip()
 
-        # --- 5. Emisor (Fallback) ---
+        # --- 4. CUITs ---
+        # Regex tolerante a ruido OCR: "C.U.I.T. N*", "CUIT:", "30-..." directo si está etiquetado
+        # Buscamos patrones numéricos de CUIT (XX-XXXXXXXX-X)
+        matches_cuit_raw = re.findall(r"\b(\d{2}[- ]?\d{8}[- ]?\d)\b", texto)
+        
+        # Filtramos para tener formato estandar XX-XXXXXXXX-X
+        cuits_validos = []
+        for c in matches_cuit_raw:
+             # Normalizamos a guiones
+             clean = c.replace(' ', '')
+             if len(clean) == 11 and '-' not in clean:
+                 # Añadir guiones hipotéticos 20123456789 -> 20-12345678-9
+                 clean = f"{clean[:2]}-{clean[2:10]}-{clean[10]}"
+             
+             if len(clean) == 13 and clean[2] == '-' and clean[11] == '-':
+                 if clean not in cuits_validos:
+                     cuits_validos.append(clean)
+        
+        datos["todos_cuits"] = cuits_validos # Debug interpreno
+
+        # Asignación Inteligente de CUITs
+        # 1. Buscar CUIT explícito de Receptor cerca de "Cliente"
+        # 2. Asumir CUIT Emisor es el primero que aparece en la cabecera
+        
+        if cuits_validos:
+            # Estrategia simple mejorada:
+            # El CUIT del emisor suele estar arriba (primeros 50% caracteres o primera coincidencia)
+            # El CUIT del receptor suele estar cerca de los datos del cliente
+            
+            datos["cuit_emisor"] = cuits_validos[0]
+            
+            if len(cuits_validos) > 1:
+                # Si hay más de uno, validamos
+                # Si el "Cliente" fue detectado, buscamos un CUIT cercano a ese match?
+                # Por simplicidad: Segundo CUIT distinto es Receptor
+                if cuits_validos[1] != cuits_validos[0]:
+                    datos["cuit_receptor"] = cuits_validos[1]
+
+        # --- 5. Emisor (Fallback mejorado) ---
+        # --- 5. Emisor (Fallback mejorado) ---
         if "emisor" not in datos:
-            lineas = texto.split('\n')
-            for l in lineas[:6]:
-                limpia = l.strip()
-                if len(limpia) > 3 and "ORIGINAL" not in limpia.upper() and "FECHA" not in limpia.upper() and "FACTURA" not in limpia.upper():
-                    datos["emisor"] = limpia
-                    break
+            # Buscamos en las primeras líneas algo que parezca una empresa
+            # Ignoramos líneas de una sola palabra "A", "ORIGINAL", fechas
+            lineas = [l.strip() for l in texto.split('\n') if l.strip()]
+            for l in lineas[:25]: # Ampliado a 25 lineas (Desab aparecia en la 16)
+                l_upper = l.upper()
+                keywords_ignoradas = [
+                    "ORIGINAL", "DUPLICADO", "FACTURA", "FECHA", "CUIT", "IIBB", 
+                    "PAGINA", "HOJA", "DOCUMENTO", "N°", "NRO", "NUMERO", "COD", "LUGAR", "SUCURSAL"
+                ]
+                
+                # Reglas de descarte:
+                if len(l) < 3: continue
+                if any(k in l_upper for k in keywords_ignoradas): continue
+                if re.match(r"^\d", l): continue # Empieza con numero
+                
+                # Si llegamos aquí, es candidato fuerte
+                datos["emisor"] = l
+                break
 
         # --- 6. Tipo de Factura ---
-        if re.search(r"COD\.\s*011", texto) or re.search(r"\bFACTURA\s+C\b", texto, re.IGNORECASE):
-            datos["tipo_factura"] = "C"
-        elif re.search(r"COD\.\s*001", texto) or re.search(r"\bFACTURA\s+A\b", texto, re.IGNORECASE):
-            datos["tipo_factura"] = "A"
-        elif re.search(r"COD\.\s*006", texto) or re.search(r"\bFACTURA\s+B\b", texto, re.IGNORECASE):
-            datos["tipo_factura"] = "B"
-        
-        # Corrección letra en el recuadro A/B/C
+        # Buscamos la letra sola en un recuadro o "COD. 0XX"
         if "tipo_factura" not in datos:
-             match_letra = re.search(r"\n\s*([ABC])\s*\n", texto)
-             if match_letra:
-                 datos["tipo_factura"] = match_letra.group(1)
+            if re.search(r"COD\.\s*011", texto) or re.search(r"\bFACTURA\s+C\b", texto, re.IGNORECASE):
+                datos["tipo_factura"] = "C"
+            elif re.search(r"COD\.\s*001", texto) or re.search(r"\bFACTURA\s+A\b", texto, re.IGNORECASE):
+                datos["tipo_factura"] = "A"
+            elif re.search(r"COD\.\s*006", texto) or re.search(r"\bFACTURA\s+B\b", texto, re.IGNORECASE):
+                datos["tipo_factura"] = "B"
+            else:
+                 # Busqueda de letra solitaria arriba
+                 match_letra = re.search(r"^\s*([ABC])\s*$", texto, re.MULTILINE)
+                 if match_letra:
+                      datos["tipo_factura"] = match_letra.group(1)
 
         return datos
 
